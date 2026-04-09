@@ -10,4 +10,4 @@ __MACOSX/
 .env
 *.pkl
 *.safetensors
-*.joblib
+*.joblibWeek4/Models/
