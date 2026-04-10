@@ -1,0 +1,14 @@
+pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+joblib
+spacy
+wordcloud
+tqdm
+torch
+transformers
+fastapi
+uvicorn
+pydantic
