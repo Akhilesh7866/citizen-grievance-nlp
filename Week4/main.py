@@ -3,28 +3,30 @@ Week 4: FastAPI — AI-Driven Citizen Grievance & Sentiment Analysis System
 """
 
 import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore")
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
 import torch
 import numpy as np
 import re
 import os
-import uvicorn
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.ensemble import RandomForestClassifier
-from transformers import AutoTokenizer, RobertaForSequenceClassification
+from transformers import RobertaTokenizer, RobertaForSequenceClassification
 
-# Resolve paths relative to this file so the app works from any working directory
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# ── App setup ─────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────
 app = FastAPI(
     title="Citizen Grievance NLP API",
     description="Classifies civic complaints into departments and scores urgency.",
     version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,47 +34,27 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ── Load models ───────────────────────────────────────────
 print("Loading models...")
 
-# Load department pipeline — try as pipeline first, then as separate model+vectorizer
-try:
-    dept_pipeline = joblib.load(os.path.join(BASE_DIR, "Models", "best_model.pkl"))
-    # Test if it has named_steps (sklearn Pipeline)
-    if hasattr(dept_pipeline, 'named_steps'):
-        USE_PIPELINE = True
-        print("  ✓ Department pipeline loaded (Pipeline mode)")
-    else:
-        # It's a standalone classifier — need separate tfidf
-        USE_PIPELINE = False
-        dept_model   = dept_pipeline
-        tfidf        = joblib.load(os.path.join(BASE_DIR, "Models", "tfidf_vectorizer.pkl"))
-        print("  ✓ Department classifier + TF-IDF loaded (standalone mode)")
-except Exception as e:
-    print(f"  ✗ Failed to load department model: {e}")
-    raise
+dept_model = joblib.load("Models/best_model.pkl")
+tfidf      = joblib.load("Models/tfidf_vectorizer.pkl")
+print("  ✓ Department classifier loaded")
 
-# Load sentiment model
-SENTIMENT_MODEL_PATH = os.path.join(BASE_DIR, "Models", "roberta_sentiment_model")
-try:
-    model_file = os.path.join(SENTIMENT_MODEL_PATH, "model.safetensors")
-    if not os.path.exists(model_file):
-        raise FileNotFoundError("model.safetensors missing")
-    # Tokenizer is standard roberta-base (same for all RoBERTa variants);
-    # load it from HuggingFace to avoid corrupted/incompatible tokenizer.json.
-    sent_tokenizer = AutoTokenizer.from_pretrained("roberta-base", use_fast=True)
-    # Load fine-tuned model weights from local path
-    sent_model     = RobertaForSequenceClassification.from_pretrained(SENTIMENT_MODEL_PATH)
-    print("  ✓ Sentiment model loaded (fine-tuned weights, roberta-base tokenizer)")
-except Exception as e:
-    print(f"  ⚠ Local model issue: {e}")
-    print("  → Loading roberta-base from HuggingFace (untrained fallback)...")
-    sent_tokenizer = AutoTokenizer.from_pretrained("roberta-base", use_fast=True)
-    sent_model     = RobertaForSequenceClassification.from_pretrained(
-                         "roberta-base", num_labels=3)
-    print("  ✓ roberta-base loaded as fallback")
+SENT_MODEL_PATH = "Models/roberta_sentiment_model"
+USE_ROBERTA     = False
 
-sent_model    = sent_model.to(device)
-sent_model.eval()
-label_encoder = joblib.load(os.path.join(BASE_DIR, "Models", "sentiment_label_encoder.pkl"))
-print(f"  ✓ Label encoder loaded | Device: {device}")
+try:
+    sent_tokenizer = RobertaTokenizer.from_pretrained(SENT_MODEL_PATH)
+    sent_model     = RobertaForSequenceClassification.from_pretrained(SENT_MODEL_PATH)
+    sent_model     = sent_model.to(device)
+    sent_model.eval()
+    USE_ROBERTA = True
+    print("  ✓ RoBERTa sentiment model loaded from local files")
+except Exception as e:
+    print(f"  ⚠ RoBERTa not available: {e}")
+    print("  → Using rule-based sentiment (reliable fallback)")
+
+label_encoder = joblib.load("Models/sentiment_label_encoder.pkl")
+print(f"  ✓ Label encoder: {list(label_encoder.classes_)}")
+print(f"  ✓ Sentiment mode: {'RoBERTa' if USE_ROBERTA else 'Rule-based'}")
 print("\nAPI ready!")
 
 # ── Priority mapping ──────────────────────────────────────
@@ -83,12 +65,50 @@ BASE_SCORES = {
     "Positive":        1.0,
 }
 
+# ── Rule-based sentiment keywords ────────────────────────
+SENTIMENT_RULES = {
+    "Critical/Urgent": [
+        "emergency", "danger", "dangerous", "hazard", "urgent", "immediately",
+        "critical", "life", "safety", "fire", "flood", "collapse", "severe",
+        "gas leak", "electric shock", "accident", "violent", "weapon",
+        "injury", "dead", "death", "immediately", "serious", "fatal",
+        "lives at risk", "people will die", "someone will die", "sos",
+        "help immediately", "act now", "respond now", "immediate action"
+    ],
+    "Negative": [
+        "broken", "damaged", "dirty", "smell", "odor", "loud", "noise",
+        "illegal", "blocked", "abandoned", "missing", "not working",
+        "unsanitary", "overflowing", "leaking", "crack", "mold",
+        "rodent", "rat", "violation", "failed", "unresolved", "problem",
+        "issue", "complaint", "no action", "not fixed", "ignored",
+        "disappointing", "frustrated", "terrible", "horrible", "awful",
+        "pothole", "garbage", "trash", "overflowing", "stink", "pest",
+        "broken", "damaged", "neglected", "disgusting", "unacceptable"
+    ],
+    "Positive": [
+        "resolved", "fixed", "clean", "working", "repaired", "improved",
+        "excellent", "good", "great", "thank", "appreciate", "satisfied",
+        "done", "completed", "happy", "pleased", "wonderful"
+    ],
+}
+
+def rule_based_sentiment(text: str):
+    """Reliable keyword-based sentiment — used when RoBERTa is unavailable."""
+    t = text.lower()
+    for sentiment, keywords in SENTIMENT_RULES.items():
+        if any(kw in t for kw in keywords):
+            confidence = 0.88 if sentiment == "Critical/Urgent" else 0.82
+            return sentiment, confidence
+    return "Neutral", 0.75
+
 # ── Schemas ───────────────────────────────────────────────
 class ComplaintRequest(BaseModel):
     text: str
     model_config = {
         "json_schema_extra": {
-            "example": {"text": "Large pothole on main road near Ward 5. Very dangerous."}
+            "example": {
+                "text": "Large pothole on main road near Ward 5. Very dangerous for vehicles."
+            }
         }
     }
 
@@ -102,7 +122,6 @@ class PredictionResponse(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────
 def clean_text(text: str) -> str:
-    """Clean text for department classifier."""
     text = str(text).lower()
     text = re.sub(r"http\S+|www\S+", "", text)
     text = re.sub(r"[^a-z\s]", " ", text)
@@ -110,33 +129,25 @@ def clean_text(text: str) -> str:
     return text
 
 def predict_department(text: str) -> str:
-    """Predict civic department."""
-    cleaned = clean_text(text)
-    if USE_PIPELINE:
-        # Pipeline handles vectorization internally
-        return dept_pipeline.predict([cleaned])[0]
-    else:
-        # Standalone: vectorize first, then predict
-        vec = tfidf.transform([cleaned])
-        return dept_model.predict(vec)[0]
+    vec = tfidf.transform([clean_text(text)])
+    return dept_model.predict(vec)[0]
 
 def predict_sentiment(text: str):
-    """Predict sentiment + confidence using RoBERTa."""
-    encoding = sent_tokenizer(
-        str(text),
-        max_length=128,
-        padding="max_length",
-        truncation=True,
-        return_tensors="pt"
-    )
-    with torch.no_grad():
-        out   = sent_model(
-            input_ids=encoding["input_ids"].to(device),
-            attention_mask=encoding["attention_mask"].to(device)
+    if USE_ROBERTA:
+        encoding = sent_tokenizer(
+            str(text), max_length=128, padding="max_length",
+            truncation=True, return_tensors="pt"
         )
-        probs = torch.softmax(out.logits, dim=1).cpu().numpy()[0]
-    pred_idx = int(np.argmax(probs))
-    return label_encoder.classes_[pred_idx], round(float(probs[pred_idx]), 4)
+        with torch.no_grad():
+            out   = sent_model(
+                input_ids=encoding["input_ids"].to(device),
+                attention_mask=encoding["attention_mask"].to(device)
+            )
+            probs = torch.softmax(out.logits, dim=1).cpu().numpy()[0]
+        pred_idx = int(np.argmax(probs))
+        return label_encoder.classes_[pred_idx], round(float(probs[pred_idx]), 4)
+    else:
+        return rule_based_sentiment(text)
 
 def get_priority_label(score: float) -> str:
     if score >= 3.5:   return "CRITICAL"
@@ -158,6 +169,7 @@ def health_check():
     return {
         "status":        "healthy",
         "models_loaded": True,
+        "sentiment_mode": "RoBERTa" if USE_ROBERTA else "Rule-based",
         "device":        str(device)
     }
 
@@ -165,7 +177,7 @@ def health_check():
 def predict(request: ComplaintRequest):
     """
     Accepts raw citizen complaint text. Returns:
-    - department: which civic department handles this
+    - department: which civic department should handle it
     - sentiment: Critical/Urgent, Negative, or Neutral
     - priority_score: 0.0 to 4.0 (higher = more urgent)
     - priority_label: CRITICAL / HIGH / MEDIUM / LOW
@@ -195,7 +207,3 @@ def predict(request: ComplaintRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
-
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
